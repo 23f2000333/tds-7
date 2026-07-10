@@ -6,10 +6,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from google import genai
-from google.genai import types
+from openai import OpenAI
 
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+client = OpenAI(
+    api_key=os.getenv("AIPIPE_TOKEN"),
+    base_url="https://aipipe.org/openai/v1",
+)
 
 app = FastAPI()
 
@@ -32,7 +34,7 @@ def clean_vendor(v):
     if v is None:
         return None
     v = str(v).strip()
-    v = re.sub(r"[.,;:]+$", "", v)  # remove trailing punctuation only
+    v = re.sub(r"[.,;:]+$", "", v)
     v = re.sub(r"\s+", " ", v)
     return v
 
@@ -51,14 +53,16 @@ def clean_currency(v):
 
     mapping = {
         "RS": "INR",
-        "RUPEES": "INR",
         "RUPEE": "INR",
+        "RUPEES": "INR",
         "₹": "INR",
         "$": "USD",
         "US$": "USD",
-        "EUROS": "EUR",
         "EURO": "EUR",
+        "EUROS": "EUR",
+        "£": "GBP",
         "POUNDS STERLING": "GBP",
+        "YEN": "JPY",
     }
 
     return mapping.get(v, v)
@@ -74,38 +78,52 @@ def clean_priority(v):
 def extract(req: RequestBody):
 
     prompt = f"""
-Extract the requested information from this invoice.
+You are an invoice extraction engine.
+
+Extract information from the invoice.
 
 Return ONLY valid JSON.
 
-Follow the supplied JSON schema exactly.
+Follow this schema EXACTLY:
+
+{json.dumps(req.schema, indent=2)}
 
 Rules:
 
-- Return exactly the schema fields.
-- No markdown.
-- No explanation.
+- Return EXACTLY the fields defined in the schema.
+- Do NOT invent extra fields.
+- Missing fields must be null.
 - Dates must be YYYY-MM-DD.
-- Currency must be ISO4217 (USD, EUR, GBP, INR, JPY).
-- total_amount, quantity, unit_price etc. must be JSON numbers.
+- Currency must be ISO4217 codes (USD, EUR, GBP, INR, JPY).
+- Numbers must be JSON numbers.
 - Preserve vendor names exactly as written except remove trailing punctuation.
-
-Invoice text:
-
-{req.text}
+- Return JSON ONLY.
 """
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_json_schema=req.schema,
-            temperature=0,
-        ),
+    response = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": "You extract structured invoice information.",
+            },
+            {
+                "role": "user",
+                "content": f"{prompt}\n\nInvoice:\n{req.text}",
+            },
+        ],
     )
 
-    result = json.loads(response.text)
+    text = response.choices[0].message.content.strip()
+
+    try:
+        result = json.loads(text)
+    except Exception:
+        result = {}
+
+    # ---------- Normalization ----------
 
     if "vendor" in result:
         result["vendor"] = clean_vendor(result["vendor"])
@@ -119,4 +137,16 @@ Invoice text:
     if "priority" in result:
         result["priority"] = clean_priority(result["priority"])
 
-    return result
+    # ---------- Ensure EXACT schema ----------
+
+    if "properties" in req.schema:
+        expected_keys = list(req.schema["properties"].keys())
+    else:
+        expected_keys = list(req.schema.keys())
+
+    final = {}
+
+    for key in expected_keys:
+        final[key] = result.get(key)
+
+    return final
